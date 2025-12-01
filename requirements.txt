@@ -1,0 +1,6 @@
+langgraph
+ollama
+sentence-transformers
+requests
+beautifulsoup4
+numpy

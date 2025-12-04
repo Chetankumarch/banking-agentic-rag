@@ -4,3 +4,4 @@ sentence-transformers
 requests
 beautifulsoup4
 numpy
+rank-bm25

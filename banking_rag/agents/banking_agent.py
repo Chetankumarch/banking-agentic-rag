@@ -1,4 +1,6 @@
 import os
+import re
+import time
 from typing import List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -12,6 +14,8 @@ from banking_rag.memory.manager import MemoryBlocks
 DEBUG_RETRIEVAL = os.getenv("BANK_RAG_DEBUG_RETRIEVAL", "1") == "1"
 ENABLE_MEMORY = os.getenv("BANK_RAG_ENABLE_MEMORY", "1") == "1"
 DEBUG_MEMORY = os.getenv("BANK_RAG_DEBUG_MEMORY", "1") == "1"
+PARALLEL_MODE = os.getenv("BANK_RAG_PARALLEL_MODE", "1") == "1"
+DEBUG_TIMING = os.getenv("BANK_RAG_DEBUG_TIMING", "0") == "1"
 
 # Singleton configs
 llm_cfg = LLMConfig.get()
@@ -21,13 +25,18 @@ mm = mem_cfg.manager()
 MEM_LTM_LIMIT = mem_cfg.ltm_limit
 
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     """State flowing through the LangGraph."""
 
-    question: str
+    user_input: str
+    query_type: str
     context: str
+    policy_context: str
+    conversation_memory: str
+    session_summary: str
     answer: str
     chunks: Optional[List]  # present only in debug mode; may be dataclasses or dicts
+    sentiment: Optional[str]
 
 
 def build_prompt(
@@ -54,39 +63,108 @@ def build_prompt(
     )
 
 
-def retrieve_and_answer_node(state: AgentState) -> AgentState:
-    """
-    LangGraph node: run RAG retrieval, incorporate memory, then answer via LLM.
-    """
-    question = state["question"]
-    if DEBUG_RETRIEVAL:
-        debug_result = rag_cfg.get_context_with_debug(question, k=5)
-        # Accept either dict with context/chunks or tuple (context, chunks)
-        if isinstance(debug_result, dict):
-            context = debug_result.get("context", "")
-            chunks = debug_result.get("chunks", [])
-        else:
-            context, chunks = debug_result
-        state["context"] = context
-        state["chunks"] = chunks  # type: ignore[assignment]
-    else:
-        context = rag_cfg.get_context(question, k=5)
-        state["context"] = context
-        state["chunks"] = None
+def classify_query(text: str) -> str:
+    """Lightweight guardrail to detect transactional/PII vs policy questions."""
+    lowered = text.lower()
+    transactional_keywords = [
+        "transfer",
+        "send money",
+        "pay",
+        "move money",
+        "deposit",
+        "withdraw",
+        "balance",
+        "my account",
+        "card number",
+        "routing",
+        "account number",
+        "ssn",
+        "social security",
+        "wire",
+        "payment",
+    ]
+    if any(k in lowered for k in transactional_keywords):
+        return "transactional_or_pii"
+    if re.search(r"\b\d{9,}\b", text):
+        return "transactional_or_pii"
+    # Default to policy/informational
+    return "policy"
 
-    if ENABLE_MEMORY:
-        blocks: MemoryBlocks = mm.get_memory_blocks(
-            question, max_summary=MEM_LTM_LIMIT
-        )
-        short_block = blocks.short_block
-        long_blocks = blocks.long_blocks
-    else:
-        short_block, long_blocks = "None", []
+
+def query_guard(state: AgentState) -> AgentState:
+    """Classify the incoming user query for routing."""
+    start = time.perf_counter()
+    user_text = state.get("user_input") or ""
+    result = {"user_input": user_text, "query_type": classify_query(user_text)}
+    if DEBUG_TIMING:
+        elapsed = (time.perf_counter() - start) * 1000
+        print(f"[timing] query_guard: {elapsed:.1f} ms")
+    return result
+
+
+def policy_answer_node(state: AgentState) -> AgentState:
+    """Placeholder retained for compatibility; not used in new parallel flow."""
+    return state
+
+
+def policy_retrieval_node(state: AgentState) -> AgentState:
+    """Retrieve policy context (RAG) without answering."""
+    start = time.perf_counter()
+    if state.get("query_type") == "transactional_or_pii":
+        return {}
+    question = state.get("user_input") or ""
+    try:
+        if DEBUG_RETRIEVAL:
+            debug_result = rag_cfg.get_context_with_debug(question, k=5)
+            if isinstance(debug_result, dict):
+                context = debug_result.get("context", "")
+                chunks = debug_result.get("chunks", [])
+            else:
+                context, chunks = debug_result
+            return {"policy_context": context, "chunks": chunks}
+        else:
+            context = rag_cfg.get_context(question, k=5)
+            return {"policy_context": context, "chunks": None}
+    finally:
+        if DEBUG_TIMING:
+            elapsed = (time.perf_counter() - start) * 1000
+            print(f"[timing] policy_retrieval_node: {elapsed:.1f} ms")
+
+
+def memory_context_node(state: AgentState) -> AgentState:
+    """Prepare memory blocks (STM/LTM) without answering."""
+    start = time.perf_counter()
+    if not ENABLE_MEMORY or state.get("query_type") == "transactional_or_pii":
+        return {"conversation_memory": "None", "session_summary": "None"}
+
+    question = state.get("user_input") or ""
+    blocks: MemoryBlocks = mm.get_memory_blocks(question, max_summary=MEM_LTM_LIMIT)
+    conversation_memory = blocks.short_block or "None"
+    session_summary = "\n\n".join(blocks.long_blocks) if blocks.long_blocks else "None"
+
+    result = {
+        "conversation_memory": conversation_memory,
+        "session_summary": session_summary,
+    }
+    if DEBUG_TIMING:
+        elapsed = (time.perf_counter() - start) * 1000
+        print(f"[timing] memory_context_node: {elapsed:.1f} ms")
+    return result
+
+
+def merger_node(state: AgentState) -> AgentState:
+    """Combine retrieval + memory context, call LLM, and update memory."""
+    start = time.perf_counter()
+    question = state.get("user_input") or ""
+    policy_context = state.get("policy_context", "")
+    short_block = state.get("conversation_memory", "None")
+    long_block = state.get("session_summary", "None")
+    long_blocks = [long_block] if long_block and long_block != "None" else []
 
     prompt = build_prompt(
         short_block=short_block,
         long_blocks=long_blocks,
-        policy_context=context,
+        policy_context=policy_context,
         user_question=question,
     )
 
@@ -100,7 +178,7 @@ def retrieve_and_answer_node(state: AgentState) -> AgentState:
     )
     state["answer"] = answer
 
-    if ENABLE_MEMORY:
+    if ENABLE_MEMORY and state.get("query_type") != "transactional_or_pii":
         mm.add_turns(question, answer)
 
         def summarize_fn(src_prompt: str) -> str:
@@ -111,15 +189,91 @@ def retrieve_and_answer_node(state: AgentState) -> AgentState:
 
         mm.summarize_if_needed(summarize_fn)
 
+    if DEBUG_TIMING:
+        elapsed = (time.perf_counter() - start) * 1000
+        print(f"[timing] merger_node: {elapsed:.1f} ms")
+    return state
+
+
+def transaction_refusal_node(state: AgentState) -> AgentState:
+    """Refuse transactional/PII requests safely."""
+    start = time.perf_counter()
+    user_text = state.get("user_input") or ""
+    refusal = (
+        "I’m a policy-only assistant and cannot perform transactions, check balances, "
+        "or handle sensitive personal data. I can explain how the bank’s overdraft and fee "
+        "policies work, if you’d like."
+    )
+    # Optional: tailor slightly with the LLM while keeping safety guardrails
+    prompt = (
+        "You are a cautious banking assistant. Given the user message, respond with a short, "
+        "safe refusal making clear you cannot transact or handle PII, and offer policy help instead.\n\n"
+        f"User message:\n{user_text}"
+    )
+    answer = llm_cfg.call_llm_prompt(
+        prompt,
+        system=(
+            "Do NOT perform transactions. Do NOT process PII. Be brief and polite. "
+            "Offer to answer policy questions instead."
+        ),
+    )
+    state["answer"] = answer or refusal
+    state["context"] = state.get("context", "")
+    state["chunks"] = None
+    if DEBUG_TIMING:
+        elapsed = (time.perf_counter() - start) * 1000
+        print(f"[timing] transaction_refusal_node: {elapsed:.1f} ms")
     return state
 
 
 def build_graph():
-    """Build a single-node LangGraph pipeline using local components."""
+    """Build a multi-node LangGraph pipeline with query guard + routing."""
     graph = StateGraph(AgentState)
-    graph.add_node("retrieve_and_answer", retrieve_and_answer_node)
-    graph.set_entry_point("retrieve_and_answer")
-    graph.add_edge("retrieve_and_answer", END)
+    graph.add_node("query_guard", query_guard)
+    graph.add_node("policy_retrieval", policy_retrieval_node)
+    graph.add_node("memory_context", memory_context_node)
+    graph.add_node("merger", merger_node)
+    graph.add_node("transaction_refusal", transaction_refusal_node)
+
+    # Entry
+    graph.set_entry_point("query_guard")
+    # Route based on query_type
+    def route(state: AgentState) -> str:
+        qt = state.get("query_type", "policy")
+        if qt == "transactional_or_pii":
+            return "transaction_refusal"
+        if qt == "policy":
+            return "policy"
+        # default to policy path
+        return "policy"
+
+    if PARALLEL_MODE:
+        graph.add_conditional_edges(
+            "query_guard",
+            route,
+            {
+                "transaction_refusal": "transaction_refusal",
+                "policy": "policy_retrieval",
+            },
+        )
+        # Parallel fan-out
+        graph.add_edge("query_guard", "memory_context")
+        graph.add_edge("policy_retrieval", "merger")
+        graph.add_edge("memory_context", "merger")
+    else:
+        graph.add_conditional_edges(
+            "query_guard",
+            route,
+            {
+                "transaction_refusal": "transaction_refusal",
+                "policy": "memory_context",
+            },
+        )
+        # Sequential: guard -> memory -> retrieval -> merger
+        graph.add_edge("memory_context", "policy_retrieval")
+        graph.add_edge("policy_retrieval", "merger")
+    graph.add_edge("merger", END)
+    graph.add_edge("transaction_refusal", END)
     return graph.compile()
 
 
@@ -136,15 +290,22 @@ def chat_loop():
             print("Goodbye!")
             break
 
+        start_time = time.perf_counter()
         state: AgentState = {
-            "question": user_input,
+            "user_input": user_input,
             "context": "",
+            "policy_context": "",
+            "conversation_memory": "None",
+            "session_summary": "None",
             "answer": "",
             "chunks": None,
         }
         result = app.invoke(state)
+        elapsed = (time.perf_counter() - start_time) * 1000
         answer = result.get("answer") or "Sorry, I could not generate an answer."
-        print(f"\nAgent: {answer}\n")
+        mode_str = "parallel" if PARALLEL_MODE else "sequential"
+        print(f"\n[mode={mode_str} latency={elapsed:.1f} ms]")
+        print(f"Agent: {answer}\n")
 
         if DEBUG_RETRIEVAL and "chunks" in result and result["chunks"] is not None:
             chunks = result["chunks"]  # type: ignore[index]

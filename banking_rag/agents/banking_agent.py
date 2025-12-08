@@ -9,6 +9,7 @@ from banking_rag.configs.llm_config import LLMConfig
 from banking_rag.configs.rag_config import RAGConfig
 from banking_rag.configs.memory_config import MemoryConfig
 from banking_rag.memory.manager import MemoryBlocks
+from banking_rag.utils.logging_utils import log_turn, iso_timestamp
 
 # Debug toggles and memory settings (default to previous behavior)
 DEBUG_RETRIEVAL = os.getenv("BANK_RAG_DEBUG_RETRIEVAL", "1") == "1"
@@ -16,6 +17,10 @@ ENABLE_MEMORY = os.getenv("BANK_RAG_ENABLE_MEMORY", "1") == "1"
 DEBUG_MEMORY = os.getenv("BANK_RAG_DEBUG_MEMORY", "1") == "1"
 PARALLEL_MODE = os.getenv("BANK_RAG_PARALLEL_MODE", "1") == "1"
 DEBUG_TIMING = os.getenv("BANK_RAG_DEBUG_TIMING", "0") == "1"
+DEBUG_SENTIMENT = os.getenv("BANK_RAG_DEBUG_SENTIMENT", "0") == "1"
+ENABLE_COMPLIANCE = os.getenv("BANK_RAG_ENABLE_COMPLIANCE_CHECK", "1") == "1"
+DEBUG_COMPLIANCE = os.getenv("BANK_RAG_DEBUG_COMPLIANCE", "0") == "1"
+ENABLE_LOGGING = os.getenv("BANK_RAG_ENABLE_LOGGING", "1") == "1"
 
 # Singleton configs
 llm_cfg = LLMConfig.get()
@@ -35,6 +40,8 @@ class AgentState(TypedDict, total=False):
     conversation_memory: str
     session_summary: str
     answer: str
+    grounded_answer: str
+    compliance_status: str
     chunks: Optional[List]  # present only in debug mode; may be dataclasses or dicts
     sentiment: Optional[str]
 
@@ -218,11 +225,98 @@ def transaction_refusal_node(state: AgentState) -> AgentState:
         ),
     )
     state["answer"] = answer or refusal
+    state["grounded_answer"] = state["answer"]
+    state["compliance_status"] = "skipped"
     state["context"] = state.get("context", "")
     state["chunks"] = None
     if DEBUG_TIMING:
         elapsed = (time.perf_counter() - start) * 1000
         print(f"[timing] transaction_refusal_node: {elapsed:.1f} ms")
+    return state
+
+
+def compliance_check_node(state: AgentState) -> AgentState:
+    """Check grounding of the answer against policy context and adjust if needed."""
+    start = time.perf_counter()
+    if not ENABLE_COMPLIANCE:
+        state["grounded_answer"] = state.get("answer", "")
+        state["compliance_status"] = "skipped"
+        return state
+
+    question = state.get("user_input", "")
+    policy_context = state.get("policy_context", "")
+    draft_answer = state.get("answer", "")
+    prompt = (
+        "You are a strict banking policy compliance checker. You will receive a user question, "
+        "retrieved policy context, and a draft answer.\n\n"
+        "Tasks:\n"
+        "- Check if each claim in the draft answer is supported by the policy context.\n"
+        "- If something is unsupported or unclear, remove or soften it and say you don't see it in the context.\n"
+        "- Do not invent details not present in the policy context.\n"
+        "- Respond with this format:\n"
+        "COMPLIANCE_STATUS: OK | UNCERTAIN | UNSUPPORTED\n"
+        "GROUNDED_ANSWER:\n"
+        "<rewritten answer>\n\n"
+        f"User question:\n{question}\n\n"
+        f"Policy context:\n{policy_context}\n\n"
+        f"Draft answer:\n{draft_answer}\n"
+    )
+
+    response = llm_cfg.call_llm_prompt(
+        prompt,
+        system=(
+            "Return only the compliance block. "
+            "COMPLIANCE_STATUS must be one of: OK, UNCERTAIN, UNSUPPORTED."
+        ),
+    )
+    grounded = draft_answer
+    status = "uncertain"
+    if response:
+        lines = response.splitlines()
+        for line in lines:
+            if line.upper().startswith("COMPLIANCE_STATUS"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    status = parts[1].strip().upper()
+            if line.strip().upper().startswith("GROUNDED_ANSWER"):
+                # Everything after this line is the grounded answer
+                idx = lines.index(line)
+                grounded = "\n".join(lines[idx + 1 :]).strip() or draft_answer
+                break
+
+    state["grounded_answer"] = grounded
+    state["compliance_status"] = status or "uncertain"
+
+    if DEBUG_TIMING:
+        elapsed = (time.perf_counter() - start) * 1000
+        print(f"[timing] compliance_check_node: {elapsed:.1f} ms")
+    return state
+
+
+def sentiment_node(state: AgentState) -> AgentState:
+    """Classify sentiment after an answer is produced."""
+    start = time.perf_counter()
+    user_text = state.get("user_input", "")
+    answer = state.get("grounded_answer") or state.get("answer", "")
+    prompt = (
+        "You are a sentiment classifier for banking support conversations.\n"
+        "Classify the user's sentiment as one of: CALM, CONFUSED, FRUSTRATED, ANGRY, CURIOUS, GRATEFUL.\n"
+        "Respond with exactly one label word.\n\n"
+        f"User message:\n{user_text}\n\nAssistant answer:\n{answer}\n"
+    )
+    label = llm_cfg.call_llm_prompt(
+        prompt,
+        system="Return exactly one word: CALM, CONFUSED, FRUSTRATED, ANGRY, CURIOUS, or GRATEFUL.",
+    )
+    sentiment = (label or "").strip().split()[0] if label else ""
+    state["sentiment"] = sentiment
+
+    if DEBUG_SENTIMENT:
+        print(f"[sentiment] user_sentiment={sentiment or 'UNKNOWN'}")
+
+    if DEBUG_TIMING:
+        elapsed = (time.perf_counter() - start) * 1000
+        print(f"[timing] sentiment_node: {elapsed:.1f} ms")
     return state
 
 
@@ -233,7 +327,9 @@ def build_graph():
     graph.add_node("policy_retrieval", policy_retrieval_node)
     graph.add_node("memory_context", memory_context_node)
     graph.add_node("merger", merger_node)
+    graph.add_node("compliance_check", compliance_check_node)
     graph.add_node("transaction_refusal", transaction_refusal_node)
+    graph.add_node("sentiment", sentiment_node)
 
     # Entry
     graph.set_entry_point("query_guard")
@@ -272,8 +368,10 @@ def build_graph():
         # Sequential: guard -> memory -> retrieval -> merger
         graph.add_edge("memory_context", "policy_retrieval")
         graph.add_edge("policy_retrieval", "merger")
-    graph.add_edge("merger", END)
-    graph.add_edge("transaction_refusal", END)
+    graph.add_edge("merger", "compliance_check")
+    graph.add_edge("compliance_check", "sentiment")
+    graph.add_edge("transaction_refusal", "sentiment")
+    graph.add_edge("sentiment", END)
     return graph.compile()
 
 
@@ -302,10 +400,37 @@ def chat_loop():
         }
         result = app.invoke(state)
         elapsed = (time.perf_counter() - start_time) * 1000
-        answer = result.get("answer") or "Sorry, I could not generate an answer."
+        # Choose grounded answer if compliance is enabled
+        if ENABLE_COMPLIANCE:
+            answer = result.get("grounded_answer") or result.get("answer") or "Sorry, I could not generate an answer."
+        else:
+            answer = result.get("answer") or "Sorry, I could not generate an answer."
         mode_str = "parallel" if PARALLEL_MODE else "sequential"
         print(f"\n[mode={mode_str} latency={elapsed:.1f} ms]")
         print(f"Agent: {answer}\n")
+
+        if DEBUG_SENTIMENT and result.get("sentiment"):
+            print(f"[sentiment] {result['sentiment']}")
+        if DEBUG_COMPLIANCE and result.get("compliance_status"):
+            print(f"[compliance] status={result['compliance_status']}")
+
+        if ENABLE_LOGGING:
+            try:
+                record = {
+                    "timestamp": iso_timestamp(),
+                    "mode": mode_str,
+                    "user_input": user_input,
+                    "query_type": result.get("query_type"),
+                    "policy_context_sample": (result.get("policy_context") or "")[:300],
+                    "answer": result.get("answer"),
+                    "grounded_answer": result.get("grounded_answer"),
+                    "compliance_status": result.get("compliance_status"),
+                    "sentiment": result.get("sentiment"),
+                    "latency_ms": elapsed,
+                }
+                log_turn(record)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[warn] Failed to log turn: {exc}")
 
         if DEBUG_RETRIEVAL and "chunks" in result and result["chunks"] is not None:
             chunks = result["chunks"]  # type: ignore[index]
